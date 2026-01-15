@@ -1,3 +1,5 @@
+#include <pico/error.h>
+#include <pico/stdio.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -15,7 +17,8 @@
 #define IBUS_HEADER1 0x40
 #define IBUS_CH_COUNT 14
 
-// Failsafe: if no valid frame for this long =>oopsie, safe outputs
+// Failsafe: if no valid frame for this long =>oopsie, safe outputs so we don't
+// run through the fence
 #define FAILSAFE_TIMEOUT_US 100000 // 100 ms
 
 // TODO: Check these with the scope. I don't trust the receiver.
@@ -227,7 +230,30 @@ int main() {
   gpio_init(LED_PIN);
   gpio_set_dir(LED_PIN, GPIO_OUT);
 
+  int i = 0;
+
+  // int MAX_LINE_LENGTH = 255;
+  // char input_line[MAX_LINE_LENGTH];
   while (true) {
+    // int c = getchar();
+    //
+    // if (c != PICO_ERROR_TIMEOUT && c != EOF) {
+    //   putchar(c);
+    //
+    //   if (c == '\n' || c == '\r') {
+    //     input_line[i] = '\0';
+    //
+    //     if (i > 0) {
+    //       printf("\nReceived line: %s\n", input_line);
+    //
+    //       i = 0;
+    //     }
+    //   } else {
+    //     if (i < MAX_LINE_LENGTH) {
+    //       input_line[i++] = (char)c;
+    //     }
+    //   }
+    // }
 
     // printf("Toggling LED on \n");
     // gpio_put(LED_PIN, 1);
