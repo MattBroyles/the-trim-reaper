@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <pico/error.h>
 #include <pico/stdio.h>
 #include <stdbool.h>
@@ -33,7 +34,7 @@
 
 // ---------------- PWM outputs ----------------
 #define OUT_COUNT 4
-static const uint OUT_PINS[OUT_COUNT] = {6, 7, 8, 9};
+static const uint OUT_PINS[OUT_COUNT] = {4, 5, 6, 7};
 
 // Output at 50 Hz RC PWM (20 ms frame)
 #define OUT_PWM_HZ 50
@@ -167,7 +168,15 @@ static bool failsafe_active(void) {
   return (now_us() - last_good_frame_us) > FAILSAFE_TIMEOUT_US;
 }
 
-static void update_arming_logic(uint16_t thr, uint16_t yaw) {
+static void update_arming_logic(uint16_t thr, uint16_t yaw,
+                                uint16_t master_arm_switch) {
+  if (master_arm_switch < 1950) {
+    armed = 0;
+    return;
+  } else {
+    armed = 1;
+  }
+
   const uint16_t THR_LOW = 1050;
   const uint16_t YAW_ARM = 1900;
 
@@ -194,20 +203,18 @@ static void update_arming_logic(uint16_t thr, uint16_t yaw) {
 }
 
 static void compute_and_write_outputs(void) {
-  if (failsafe_active() || !armed) {
-    for (int i = 0; i < OUT_COUNT; i++) {
-      pwm_out_write_us(OUT_PINS[i], 1000);
-    }
-    return;
-  }
-
-  // Use CH3 as throttle (common RC mapping)
-  uint16_t thr = clamp_u16(ch_raw[2], CH_MIN_US, CH_MAX_US);
-
-  // Placeholder: throttle to all outputs
   for (int i = 0; i < OUT_COUNT; i++) {
-    pwm_out_write_us(OUT_PINS[i], thr);
+
+    uint16_t output = clamp_u16(ch_raw[i], CH_MIN_US, CH_MAX_US);
+
+    if (failsafe_active() || !armed) {
+      output = 1500;
+    }
+    printf("Writing %d to channel %d ", output, i);
+    pwm_out_write_us(OUT_PINS[i], output);
   }
+  printf("\n");
+  return;
 }
 
 int main() {
@@ -232,43 +239,17 @@ int main() {
 
   int i = 0;
 
-  // int MAX_LINE_LENGTH = 255;
-  // char input_line[MAX_LINE_LENGTH];
-  while (true) {
-    // int c = getchar();
-    //
-    // if (c != PICO_ERROR_TIMEOUT && c != EOF) {
-    //   putchar(c);
-    //
-    //   if (c == '\n' || c == '\r') {
-    //     input_line[i] = '\0';
-    //
-    //     if (i > 0) {
-    //       printf("\nReceived line: %s\n", input_line);
-    //
-    //       i = 0;
-    //     }
-    //   } else {
-    //     if (i < MAX_LINE_LENGTH) {
-    //       input_line[i++] = (char)c;
-    //     }
-    //   }
-    // }
+  gpio_put(LED_PIN, 1);
 
-    // printf("Toggling LED on \n");
-    // gpio_put(LED_PIN, 1);
-    // sleep_ms(1000);
-    //
-    // printf("Toggling LED off \n");
-    // gpio_put(LED_PIN, 0);
-    // sleep_ms(1000);
+  while (true) {
 
     (void)ibus_poll_decode();
 
     if (!failsafe_active()) {
       uint16_t thr = clamp_u16(ch_raw[2], CH_MIN_US, CH_MAX_US);
       uint16_t yaw = clamp_u16(ch_raw[3], CH_MIN_US, CH_MAX_US);
-      update_arming_logic(thr, yaw);
+      uint16_t master_arm = clamp_u16(ch_raw[6], CH_MIN_US, CH_MAX_US);
+      update_arming_logic(thr, yaw, master_arm);
     } else {
       armed = false;
     }
@@ -277,8 +258,13 @@ int main() {
 
     if (now_us() - last_print > 100000) {
       last_print = now_us();
-      printf("FS=%d armed=%d CH1-4: %u %u %u %u\n", failsafe_active(), armed,
-             ch_raw[0], ch_raw[1], ch_raw[2], ch_raw[3]);
+      printf("FS=%d armed => %d CH_1 => %u CH_2 => %u CH_3 "
+             "=> %u CH_4 "
+             "=> %u CH_5 => %u CH_6 => %u CH_7 => %u CH_8 => %u CH_9 => %u "
+             "CH_10 => %u\r",
+             failsafe_active(), armed, ch_raw[0], ch_raw[1], ch_raw[2],
+             ch_raw[3], ch_raw[4], ch_raw[5], ch_raw[6], ch_raw[7], ch_raw[8],
+             ch_raw[9]);
     }
 
     tight_loop_contents();
