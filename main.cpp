@@ -1,57 +1,69 @@
 #include <cstdint>
-#include <pico/error.h>
 #include <pico/stdio.h>
 #include <stdbool.h>
-#include <stdio.h>
-#include <string.h>
 
-#include "hardware/clocks.h"
 #include "hardware/gpio.h"
-#include "hardware/pwm.h"
 #include "hardware/uart.h"
 #include "pico/stdlib.h"
 
-// ---------------- iBUS definitions ----------------
+// ============================================================
+// iBUS definitions
+// ============================================================
 #define IBUS_BAUD 115200
 #define IBUS_FRAME_LEN 32
 #define IBUS_HEADER0 0x20
 #define IBUS_HEADER1 0x40
 #define IBUS_CH_COUNT 14
 
-// Failsafe: if no valid frame for this long =>oopsie, safe outputs so we don't
-// run through the fence
 #define FAILSAFE_TIMEOUT_US 100000 // 100 ms
 
-// TODO: Check these with the scope. I don't trust the receiver.
-//  Typical RC range
 #define CH_MIN_US 1000
 #define CH_MAX_US 2000
 #define CH_CENTER_US 1500
 
-// ---------------- UART pins ----------------
 #define IBUS_UART uart0
 #define IBUS_UART_RX_PIN 1
 
-// ---------------- PWM outputs ----------------
-#define OUT_COUNT 4
-static const uint OUT_PINS[OUT_COUNT] = {4, 5, 6, 7};
+// ============================================================
+// Sabertooth Packetized Serial
+// ============================================================
+#define SABER_UART uart1
+#define SABER_UART_TX_PIN 8
+#define SABER_BAUD 9600
+#define SABER_ADDR 128 // DIP switch address
 
-// Output at 50 Hz RC PWM (20 ms frame)
-#define OUT_PWM_HZ 50
+// ============================================================
+// Mixer tuning
+// ============================================================
+static const float DEADZONE = 0.05f;
+static const float EXPO = 0.40f;
+static const float TURN_AT_ZERO_SPEED = 1.00f;
+static const float TURN_AT_FULL_SPEED = 0.35f;
+static const float SLEW_PER_SEC = 2.5f;
+static const float MAX_OUTPUT = 1.0f;
 
-// PWM clock at 1 tick = 1 us (easy mapping).
-// Set PWM wrap to 20000 for 20 ms at 1 MHz tick rate.
-#define PWM_TICK_HZ 1000000u
-#define PWM_WRAP_US (1000000u / OUT_PWM_HZ) // 20000 us at 50 Hz
+static const int CH_THROTTLE = 2;
+static const int CH_STEER = 3;
+static const int CH_ARM = 6;
 
-// ---------------- iBUS state ----------------
+// ============================================================
+// State
+// ============================================================
 static uint8_t ibus_buf[IBUS_FRAME_LEN];
-static int ibus_pos = 0;
-
-static uint16_t ch_raw[IBUS_CH_COUNT]; // raw 16-bit channel values from frame
+static uint8_t ibus_pos = 0;
+static uint16_t ch_raw[IBUS_CH_COUNT];
 static uint32_t last_good_frame_us = 0;
 
-// ---------------- Utility ----------------
+static bool armed = false;
+static uint32_t arm_start_us = 0;
+
+static float left_cmd = 0.0f;
+static float right_cmd = 0.0f;
+static uint32_t last_mix_us = 0;
+
+// ============================================================
+// Utility
+// ============================================================
 static inline uint32_t now_us(void) {
   return to_us_since_boot(get_absolute_time());
 }
@@ -64,8 +76,19 @@ static inline uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi) {
   return v;
 }
 
-// iBUS checksum: 0xFFFF - sum(bytes[0..29]) == uint16(frame[30..31],
-// little-endian)
+static inline float clamp_f(float v, float lo, float hi) {
+  if (v < lo)
+    return lo;
+  if (v > hi)
+    return hi;
+  return v;
+}
+
+static inline float f_abs(float x) { return x < 0 ? -x : x; }
+
+// ============================================================
+// iBUS decode
+// ============================================================
 static bool ibus_checksum_ok(const uint8_t *f) {
   uint16_t sum = 0;
   for (int i = 0; i < 30; i++)
@@ -74,18 +97,18 @@ static bool ibus_checksum_ok(const uint8_t *f) {
   return (uint16_t)(0xFFFF - sum) == chk;
 }
 
-// Poll UART, return true when a *new valid* frame was decoded
 static bool ibus_poll_decode(void) {
   while (uart_is_readable(IBUS_UART)) {
     uint8_t b = uart_getc(IBUS_UART);
 
-    // Better resync: if we're mid-frame and see header0, restart at pos=1
+    // If we're in the middle of a frame and see header0, restart frame capture
     if (ibus_pos > 0 && b == IBUS_HEADER0) {
       ibus_buf[0] = b;
       ibus_pos = 1;
       continue;
     }
 
+    // Sync header bytes
     if (ibus_pos == 0) {
       if (b != IBUS_HEADER0)
         continue;
@@ -96,16 +119,20 @@ static bool ibus_poll_decode(void) {
       }
     }
 
+    if (ibus_pos >= IBUS_FRAME_LEN) {
+      ibus_pos = 0;
+      continue;
+    }
+
     ibus_buf[ibus_pos++] = b;
 
     if (ibus_pos == IBUS_FRAME_LEN) {
       ibus_pos = 0;
 
       if (!ibus_checksum_ok(ibus_buf)) {
-        return false; // bad frame; keep trying
+        return false;
       }
 
-      // Extract channels (little endian)
       for (int ch = 0; ch < IBUS_CH_COUNT; ch++) {
         int idx = 2 + ch * 2;
         ch_raw[ch] =
@@ -119,62 +146,87 @@ static bool ibus_poll_decode(void) {
   return false;
 }
 
-// ---------------- PWM output setup ----------------
-static void pwm_init_slice_if_needed(uint slice, bool *slice_inited) {
-  if (slice_inited[slice])
-    return;
-
-  // Set PWM clock divider to make the PWM counter tick at 1 MHz.
-  uint32_t sys_hz = clock_get_hz(clk_sys);
-  float div = (float)sys_hz / (float)PWM_TICK_HZ;
-  pwm_set_clkdiv(slice, div);
-
-  // Set period (wrap) to 20,000 us for 50 Hz
-  pwm_set_wrap(slice, PWM_WRAP_US);
-
-  pwm_set_enabled(slice, true);
-  slice_inited[slice] = true;
+// ============================================================
+// Sabertooth packet serial
+// ============================================================
+static inline void saber_uart_init(void) {
+  uart_init(SABER_UART, SABER_BAUD);
+  gpio_set_function(SABER_UART_TX_PIN, GPIO_FUNC_UART);
+  uart_set_format(SABER_UART, 8, 1, UART_PARITY_NONE);
+  uart_set_fifo_enabled(SABER_UART, true);
+  sleep_ms(200);
 }
 
-static void pwm_out_init_all(void) {
-  // Pico has a small number of PWM slices; track which ones we configured.
-  // Safe to size for 16 slices.
-  bool slice_inited[16] = {0};
-
-  for (int i = 0; i < OUT_COUNT; i++) {
-    uint gpio = OUT_PINS[i];
-    gpio_set_function(gpio, GPIO_FUNC_PWM);
-
-    uint slice = pwm_gpio_to_slice_num(gpio);
-    pwm_init_slice_if_needed(slice, slice_inited);
-
-    // Start with a safe value (1000 us)
-    pwm_set_gpio_level(gpio, 1000);
-  }
+static inline void saber_send(uint8_t addr, uint8_t cmd, uint8_t data) {
+  uint8_t chk = (addr + cmd + data) & 0x7F;
+  uart_putc_raw(SABER_UART, addr);
+  uart_putc_raw(SABER_UART, cmd);
+  uart_putc_raw(SABER_UART, data);
+  uart_putc_raw(SABER_UART, chk);
 }
 
-static inline void pwm_out_write_us(uint gpio, uint16_t pulse_us) {
-  pwm_set_gpio_level(gpio, pulse_us);
+static inline uint8_t saber_norm_to_7bit(float x) {
+  x = clamp_f(x, -1.0f, 1.0f);
+  int v = (int)(64.0f + x * 63.0f + (x >= 0 ? 0.5f : -0.5f));
+  if (v < 0)
+    v = 0;
+  if (v > 127)
+    v = 127;
+  return (uint8_t)v;
 }
 
-// ---------------- arming + mixing ----------------
-static bool armed = false;
-static uint32_t arm_start_us = 0;
+static inline void saber_set(float left, float right) {
+  saber_send(SABER_ADDR, 6, saber_norm_to_7bit(left));
+  saber_send(SABER_ADDR, 7, saber_norm_to_7bit(right));
+}
 
+// ============================================================
+// Mixer math
+// ============================================================
+static inline float us_to_norm(uint16_t us) {
+  us = clamp_u16(us, CH_MIN_US, CH_MAX_US);
+  if (us >= CH_CENTER_US)
+    return (float)(us - CH_CENTER_US) / (float)(CH_MAX_US - CH_CENTER_US);
+  else
+    return (float)(us - CH_CENTER_US) / (float)(CH_CENTER_US - CH_MIN_US);
+}
+
+static inline float apply_deadzone(float x) {
+  float a = f_abs(x);
+  if (a < DEADZONE)
+    return 0.0f;
+  float sign = (x >= 0) ? 1.0f : -1.0f;
+  float mag = (a - DEADZONE) / (1.0f - DEADZONE);
+  return sign * mag;
+}
+
+static inline float expo_curve(float x) {
+  return (1.0f - EXPO) * x + EXPO * x * x * x;
+}
+
+static inline float slew(float cur, float tgt, float maxd) {
+  float d = tgt - cur;
+  if (d > maxd)
+    d = maxd;
+  if (d < -maxd)
+    d = -maxd;
+  return cur + d;
+}
+
+// ============================================================
+// Arming + output
+// ============================================================
 static bool failsafe_active(void) {
-  // If we have never received a frame, treat as failsafe
   if (last_good_frame_us == 0)
     return true;
   return (now_us() - last_good_frame_us) > FAILSAFE_TIMEOUT_US;
 }
 
-static void update_arming_logic(uint16_t thr, uint16_t yaw,
-                                uint16_t master_arm_switch) {
-  if (master_arm_switch < 1950) {
-    armed = 0;
+static void update_arming(uint16_t thr, uint16_t yaw, uint16_t arm) {
+  if (arm < 1950) {
+    armed = false;
+    arm_start_us = 0;
     return;
-  } else {
-    armed = 1;
   }
 
   const uint16_t THR_LOW = 1050;
@@ -182,91 +234,83 @@ static void update_arming_logic(uint16_t thr, uint16_t yaw,
 
   if (!armed) {
     if (thr < THR_LOW && yaw > YAW_ARM) {
-      if (arm_start_us == 0)
+      if (!arm_start_us)
         arm_start_us = now_us();
       if (now_us() - arm_start_us > 500000)
         armed = true;
-    } else {
+    } else
       arm_start_us = 0;
-    }
   } else {
-    const uint16_t YAW_DISARM = 1100;
-    if (thr < THR_LOW && yaw < YAW_DISARM) {
-      if (arm_start_us == 0)
+    const uint16_t YAW_DIS = 1100;
+    if (thr < THR_LOW && yaw < YAW_DIS) {
+      if (!arm_start_us)
         arm_start_us = now_us();
       if (now_us() - arm_start_us > 500000)
         armed = false;
-    } else {
+    } else
       arm_start_us = 0;
-    }
   }
 }
 
-static void compute_and_write_outputs(void) {
-  for (int i = 0; i < OUT_COUNT; i++) {
-
-    uint16_t output = clamp_u16(ch_raw[i], CH_MIN_US, CH_MAX_US);
-
-    if (failsafe_active() || !armed) {
-      output = 1500;
-    }
-    printf("Writing %d to channel %d ", output, i);
-    pwm_out_write_us(OUT_PINS[i], output);
+// ============================================================
+// Main mixer loop
+// ============================================================
+static void update_motors(void) {
+  if (failsafe_active() || !armed) {
+    left_cmd = right_cmd = 0.0f;
+    last_mix_us = now_us();
+    saber_set(0.0f, 0.0f);
+    return;
   }
-  printf("\n");
-  return;
+
+  float throttle = us_to_norm(ch_raw[CH_THROTTLE]);
+  float steering = us_to_norm(ch_raw[CH_STEER]);
+
+  throttle = expo_curve(apply_deadzone(throttle));
+  steering = expo_curve(apply_deadzone(steering));
+
+  float speed = f_abs(throttle);
+  float turn_scale =
+      TURN_AT_ZERO_SPEED + (TURN_AT_FULL_SPEED - TURN_AT_ZERO_SPEED) * speed;
+
+  float turn = steering * turn_scale;
+
+  float tgt_left = clamp_f(throttle + turn, -MAX_OUTPUT, MAX_OUTPUT);
+  float tgt_right = clamp_f(throttle - turn, -MAX_OUTPUT, MAX_OUTPUT);
+
+  uint32_t t = now_us();
+  float dt = (float)(t - last_mix_us) / 1000000.0f;
+  last_mix_us = t;
+
+  float maxd = SLEW_PER_SEC * dt;
+  left_cmd = slew(left_cmd, tgt_left, maxd);
+  right_cmd = slew(right_cmd, tgt_right, maxd);
+
+  saber_set(left_cmd, right_cmd);
 }
 
+// ============================================================
+// main
+// ============================================================
 int main() {
   stdio_init_all();
-  sleep_ms(1200);
+  sleep_ms(1000);
 
-  // UART RX-only setup for iBUS
   uart_init(IBUS_UART, IBUS_BAUD);
   gpio_set_function(IBUS_UART_RX_PIN, GPIO_FUNC_UART);
-  uart_set_format(IBUS_UART, 8, 1, UART_PARITY_NONE);
-  uart_set_fifo_enabled(IBUS_UART, true);
 
-  // PWM outputs
-  pwm_out_init_all();
-
-  uint32_t last_print = now_us();
-
-  const uint LED_PIN = PICO_DEFAULT_LED_PIN;
-
-  gpio_init(LED_PIN);
-  gpio_set_dir(LED_PIN, GPIO_OUT);
-
-  int i = 0;
-
-  gpio_put(LED_PIN, 1);
+  saber_uart_init();
 
   while (true) {
-
-    (void)ibus_poll_decode();
+    ibus_poll_decode();
 
     if (!failsafe_active()) {
-      uint16_t thr = clamp_u16(ch_raw[2], CH_MIN_US, CH_MAX_US);
-      uint16_t yaw = clamp_u16(ch_raw[3], CH_MIN_US, CH_MAX_US);
-      uint16_t master_arm = clamp_u16(ch_raw[6], CH_MIN_US, CH_MAX_US);
-      update_arming_logic(thr, yaw, master_arm);
+      update_arming(ch_raw[CH_THROTTLE], ch_raw[CH_STEER], ch_raw[CH_ARM]);
     } else {
       armed = false;
     }
 
-    compute_and_write_outputs();
-
-    if (now_us() - last_print > 100000) {
-      last_print = now_us();
-      printf("FS=%d armed => %d CH_1 => %u CH_2 => %u CH_3 "
-             "=> %u CH_4 "
-             "=> %u CH_5 => %u CH_6 => %u CH_7 => %u CH_8 => %u CH_9 => %u "
-             "CH_10 => %u\r",
-             failsafe_active(), armed, ch_raw[0], ch_raw[1], ch_raw[2],
-             ch_raw[3], ch_raw[4], ch_raw[5], ch_raw[6], ch_raw[7], ch_raw[8],
-             ch_raw[9]);
-    }
-
+    update_motors();
     tight_loop_contents();
   }
 }
