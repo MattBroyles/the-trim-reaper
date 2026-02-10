@@ -2,9 +2,9 @@
 
 Firmware for a **robot mower / differential-drive robot** using:
 
-- Raspberry Pi Pico (RP2040)
+- Raspberry Pi Pico 2 (RP2350)
 - FlySky / iBUS RC receiver
-- Sabertooth motor controller (packetized serial)
+- Sabertooth 2x60 motor controller (packetized serial)
 - Two drive motors (left/right)
 
 The Pico receives RC commands over iBUS, applies deadzone + expo + slew limiting,
