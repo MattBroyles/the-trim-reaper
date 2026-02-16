@@ -1,6 +1,8 @@
 #include <cstdint>
+#include <iostream>
 #include <pico/stdio.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
@@ -68,6 +70,7 @@ static const float MAX_OUTPUT = 1.0f;
 static const int CH_THROTTLE = 2;
 static const int CH_STEER = 3;
 static const int CH_ARM = 6;
+static const int CH_SPEED_SCALE = 7;
 
 // ============================================================
 // State
@@ -222,6 +225,9 @@ static inline void saber_send(uint8_t addr, uint8_t cmd, uint8_t data) {
   uart_putc_raw(SABER_UART, cmd);
   uart_putc_raw(SABER_UART, data);
   uart_putc_raw(SABER_UART, chk);
+
+  printf("Sent addr -> %u, cmd -> %u, data -> %u, checksum -> %u \n", addr, cmd,
+         data, chk);
 }
 
 // Convert normalized [-1..1] to Sabertooth 7-bit speed [0..127]
@@ -297,38 +303,48 @@ static inline float slew(float cur, float tgt, float maxd) {
 static bool failsafe_active(void) {
   if (last_good_frame_us == 0)
     return true;
-  return (now_us() - last_good_frame_us) > FAILSAFE_TIMEOUT_US;
+
+  bool failsafe_active = (now_us() - last_good_frame_us) > FAILSAFE_TIMEOUT_US;
+
+  printf("Failsafe active -> %d \n", failsafe_active);
+
+  return failsafe_active;
 }
 
 static void update_arming(uint16_t thr, uint16_t yaw, uint16_t arm) {
   // Hardware arm switch must be high
   if (arm < 1950) {
+
+    printf("Hardware arm switch is < 1950");
+
     armed = false;
     arm_start_us = 0;
     return;
-  }
-
-  const uint16_t THR_LOW = 1050;
-  const uint16_t YAW_ARM = 1900;
-
-  if (!armed) {
-    if (thr < THR_LOW && yaw > YAW_ARM) {
-      if (!arm_start_us)
-        arm_start_us = now_us();
-      if (now_us() - arm_start_us > 500000)
-        armed = true;
-    } else
-      arm_start_us = 0;
   } else {
-    const uint16_t YAW_DIS = 1100;
-    if (thr < THR_LOW && yaw < YAW_DIS) {
-      if (!arm_start_us)
-        arm_start_us = now_us();
-      if (now_us() - arm_start_us > 500000)
-        armed = false;
-    } else
-      arm_start_us = 0;
+    armed = true;
   }
+
+  // const uint16_t THR_LOW = 1050;
+  // const uint16_t YAW_ARM = 1900;
+
+  // if (!armed) {
+  //   if (thr < THR_LOW && yaw > YAW_ARM) {
+  //     if (!arm_start_us)
+  //       arm_start_us = now_us();
+  //     if (now_us() - arm_start_us > 500000)
+  //       armed = true;
+  //   } else
+  //     arm_start_us = 0;
+  // } else {
+  //   const uint16_t YAW_DIS = 1100;
+  //   if (thr < THR_LOW && yaw < YAW_DIS) {
+  //     if (!arm_start_us)
+  //       arm_start_us = now_us();
+  //     if (now_us() - arm_start_us > 500000)
+  //       armed = false;
+  //   } else
+  //     arm_start_us = 0;
+  // }
 }
 
 // ============================================================
@@ -340,6 +356,7 @@ static void update_arming(uint16_t thr, uint16_t yaw, uint16_t arm) {
 static void update_motors(void) {
   // Safety cutoff
   if (failsafe_active() || !armed) {
+    printf("NOT ARMED!!");
     left_cmd = right_cmd = 0.0f;
     last_mix_us = now_us();
     saber_set(0.0f, 0.0f);
@@ -377,6 +394,7 @@ static void update_motors(void) {
   right_cmd = slew(right_cmd, tgt_right, maxd);
 
   // Send to motor controller
+  printf("Left_cmd -> %f, right_cmd -> %f \n", left_cmd, right_cmd);
   saber_set(left_cmd, right_cmd);
 }
 
@@ -397,6 +415,11 @@ int main() {
   while (true) {
     // Attempt to decode an RC frame
     ibus_poll_decode();
+
+    for (int i = 0; i < IBUS_CH_COUNT; i++) {
+      printf("CH_%d -> %d ", i, ch_raw[i]);
+    }
+    printf("\n");
 
     // Update arming unless failsafe active
     if (!failsafe_active()) {
